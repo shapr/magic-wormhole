@@ -1,5 +1,5 @@
 import wormhole
-from zope.interface import implementer, alsoProvides
+from zope.interface import implementer
 from twisted.internet.defer import Deferred, gatherResults
 from twisted.internet.protocol import Protocol, Factory
 
@@ -10,7 +10,6 @@ from ..common import poll_until
 from ..._interfaces import IDilationConnector
 from ...eventual import EventualQueue
 from ..._dilation._noise import NoiseConnection
-from ..._dilation.subchannel import ISubchannelFactory
 
 
 APPID = u"lothar.com/dilate-test"
@@ -19,15 +18,14 @@ APPID = u"lothar.com/dilate-test"
 def doBoth(d1, d2):
     return gatherResults([d1, d2], True)
 
-
-class L(Protocol):
+class TestProtocol(Protocol):
     def connectionMade(self):
         print("got connection")
         self.transport.write(b"hello\n")
 
     def dataReceived(self, data):
         print("dataReceived: {}".format(data))
-        self.factory.d.callback(data)
+        self.factory.d.callback(data) # part of the shortcut
 
     def connectionLost(self, why):
         print("connectionLost")
@@ -35,10 +33,10 @@ class L(Protocol):
 
 @pytest_twisted.ensureDeferred()
 @pytest.mark.skipif(not NoiseConnection, reason="noiseprotocol required")
-async def test_control(reactor, mailbox):
+async def test_subchannel_create(reactor, mailbox):
     eq = EventualQueue(reactor)
-    w1 = wormhole.create(APPID, mailbox.url, reactor, dilation_subprotocols={SubFac()})
-    w2 = wormhole.create(APPID, mailbox.url, reactor, dilation_subprotocols={SubFac()})
+    w1 = wormhole.create(APPID, mailbox.url, reactor, dilation=True)
+    w2 = wormhole.create(APPID, mailbox.url, reactor, dilation=True)
     w1.allocate_code()
     code = await w1.get_code()
     print("code is: {}".format(code))
@@ -46,27 +44,25 @@ async def test_control(reactor, mailbox):
     await doBoth(w1.get_verifier(), w2.get_verifier())
     print("connected")
 
-    eps1 = w1.dilate()
-    eps2 = w2.dilate()
-    print("w.dilate ready")
-
     f1 = Factory()
-    f1.subprotocol = "proto"
-    alsoProvides(f1, ISubchannelFactory)
-    f1.protocol = L
+    f1.protocol = TestProtocol
     f1.d = Deferred()
     f1.d.addCallback(lambda data: eq.fire_eventually(data))
-    d1 = eps1.control.connect(f1)
 
     f2 = Factory()
-    f2.subprotocol = "proto"
-    alsoProvides(f2, ISubchannelFactory)
-    f2.protocol = L
+    f2.protocol = TestProtocol
     f2.d = Deferred()
     f2.d.addCallback(lambda data: eq.fire_eventually(data))
-    d2 = eps2.control.connect(f2)
-    await d1
-    await d2
+
+    # dilate() returns an instance of DilatedWormhole
+    eps1 = w1.dilate({})
+    # this server can handle the 'proto' subprotocol
+    eps2 = w2.dilate({"proto":lambda dw: f2})
+    print("w.dilate ready")
+
+    d1 = eps1.subprotocol_connector_for("proto").connect(f1)
+
+    await d1 # this is only for the client side, the one that does *connect*
     print("control endpoints connected")
     # note: I'm making some horrible assumptions about one-to-one writes
     # and reads across a TCP stack that isn't obligated to maintain such
@@ -80,7 +76,7 @@ async def test_control(reactor, mailbox):
 
     await w1.close()
     await w2.close()
-test_control.timeout = 30
+test_subchannel_create.timeout = 30
 
 
 class ReconP(Protocol):
@@ -99,7 +95,6 @@ class ReconP(Protocol):
         self.eventually("connectionLost", (self, why))
 
 
-@implementer(ISubchannelFactory)
 class ReconF(Factory):
     protocol = ReconP
     subprotocol = "proto"
@@ -116,30 +111,24 @@ class ReconF(Factory):
         self.deferreds[name] = d
         return d
 
-
-@implementer(ISubchannelFactory)
-class SubFac(Factory):
-    subprotocol = "rosalind"
-
-
 @pytest_twisted.ensureDeferred()
 @pytest.mark.skipif(not NoiseConnection, reason="noiseprotocol required")
 async def test_reconnect(reactor, mailbox):
     eq = EventualQueue(reactor)
-    w1 = wormhole.create(APPID, mailbox.url, reactor, dilation_subprotocols={SubFac()})
-    w2 = wormhole.create(APPID, mailbox.url, reactor, dilation_subprotocols={SubFac()})
+    w1 = wormhole.create(APPID, mailbox.url, reactor, dilation=True)
+    w2 = wormhole.create(APPID, mailbox.url, reactor, dilation=True)
     w1.allocate_code()
     code = await w1.get_code()
     w2.set_code(code)
     await doBoth(w1.get_verifier(), w2.get_verifier())
 
-    eps1 = w1.dilate()
-    eps2 = w2.dilate()
+    f1, f2 = ReconF(eq), ReconF(eq)
+
+    eps1 = w1.dilate({"hollaback":lambda x:f1}) # serve supports hollaback subproto
+    eps2 = w2.dilate({})
     print("w.dilate ready")
 
-    f1, f2 = ReconF(eq), ReconF(eq)
-    d1, d2 = eps1.control.connect(f1), eps2.control.connect(f2)
-    await d1
+    d2 = eps2.subprotocol_connector_for("hollaback").connect(f2)
     await d2
 
     protocols = {}
@@ -158,6 +147,8 @@ async def test_reconnect(reactor, mailbox):
     # the ACKs are now in flight and may not arrive before we kill the
     # connection
 
+    # we already await'd these, they have fired. They fire only once.
+    # A Deferred() fires only once, must replace to make it work for the test
     f1.resetDeferred("connectionMade")
     f2.resetDeferred("connectionMade")
     d1 = f1.resetDeferred("dataReceived")
@@ -168,6 +159,9 @@ async def test_reconnect(reactor, mailbox):
     orig_connection = sc._manager._connection
     orig_connection.disconnect()
 
+    # XXX replace with status API calls! think of the beauty!
+    # XXX status api motivation: ugly tests encourage API improvements BLOG POST
+    # or at least, ugliness reduction
     # stall until the connection has been replaced
     await poll_until(lambda: sc._manager._connection
                      and (orig_connection != sc._manager._connection))
@@ -175,12 +169,16 @@ async def test_reconnect(reactor, mailbox):
     # now write some more data, which should travel over the new
     # connection
     protocols[1].transport.write(b"more\n")
+    # if we hadn't called resetDeferred earlier, we'd get the value of
+    # d2 *before* the reset, not the new value
     data2 = await d2
     assert data2 == b"more\n"
 
+    # ??? this already got checked a few lines above ???
     replacement_connection = sc._manager._connection
     assert orig_connection != replacement_connection
 
+    # shae: the layer above should not observe the connection bobble
     # the application-visible Protocol should not observe the
     # interruption
     assert not f1.deferreds["connectionMade"].called
@@ -195,20 +193,20 @@ async def test_reconnect(reactor, mailbox):
 @pytest.mark.skipif(not NoiseConnection, reason="noiseprotocol required")
 async def test_data_while_offline(reactor, mailbox):
     eq = EventualQueue(reactor)
-    w1 = wormhole.create(APPID, mailbox.url, reactor, dilation_subprotocols={SubFac()})
-    w2 = wormhole.create(APPID, mailbox.url, reactor, dilation_subprotocols={SubFac()})
+    w1 = wormhole.create(APPID, mailbox.url, reactor, dilation=True)
+    w2 = wormhole.create(APPID, mailbox.url, reactor, dilation=True)
     w1.allocate_code()
     code = await w1.get_code()
     w2.set_code(code)
     await doBoth(w1.get_verifier(), w2.get_verifier())
 
-    eps1 = w1.dilate()
-    eps2 = w2.dilate()
+    f1, f2 = ReconF(eq), ReconF(eq)
+
+    eps1 = w1.dilate({"offline":lambda x:f1})
+    eps2 = w2.dilate({})
     print("w.dilate ready")
 
-    f1, f2 = ReconF(eq), ReconF(eq)
-    d1, d2 = eps1.control.connect(f1), eps2.control.connect(f2)
-    await d1
+    d2 = eps2.subprotocol_connector_for("offline").connect(f2)
     await d2
 
     protocols = {}
@@ -280,62 +278,60 @@ async def test_data_while_offline(reactor, mailbox):
 @pytest.mark.skipif(not NoiseConnection, reason="noiseprotocol required")
 async def test_endpoints(reactor, mailbox):
     eq = EventualQueue(reactor)
-    w1 = wormhole.create(APPID, mailbox.url, reactor, dilation_subprotocols={SubFac()})
-    w2 = wormhole.create(APPID, mailbox.url, reactor, dilation_subprotocols={SubFac()})
+    w1 = wormhole.create(APPID, mailbox.url, reactor, dilation=True)
+    w2 = wormhole.create(APPID, mailbox.url, reactor, dilation=True)
     w1.allocate_code()
     code = await w1.get_code()
     w2.set_code(code)
     await doBoth(w1.get_verifier(), w2.get_verifier())
 
-    eps1 = w1.dilate()
-    eps2 = w2.dilate()
+    f1 = ReconF(eq)
+
+    eps1 = w1.dilate({})
+    eps2 = w2.dilate({"proto":lambda x:f1})
     print("w.dilate ready")
 
-    f0 = ReconF(eq)
-    f0.subprotocol = "proto"
-    await eps2.listen.listen(f0)
 
     from twisted.python import log
-    f1 = ReconF(eq)
-    f1.subprotocol = "proto"
+    f2 = ReconF(eq)
     log.msg("connecting")
-    p1_client = await eps1.connect.connect(f1)
+    p1_client = await eps1.subprotocol_connector_for("proto").connect(f2)
     log.msg("sending c->s")
     p1_client.transport.write(b"hello from p1\n")
-    data = await f0.deferreds["dataReceived"]
+    data = await f1.deferreds["dataReceived"]
     assert data == b"hello from p1\n"
-    p1_server = await f0.deferreds["connectionMade"]
+    p1_server = await f1.deferreds["connectionMade"]
     log.msg("sending s->c")
     p1_server.transport.write(b"hello p1\n")
     log.msg("waiting for client to receive")
-    data = await f1.deferreds["dataReceived"]
+    data = await f2.deferreds["dataReceived"]
     assert data == b"hello p1\n"
 
     # open a second channel
-    f0.resetDeferred("connectionMade")
-    f0.resetDeferred("dataReceived")
+    f1.resetDeferred("connectionMade")
     f1.resetDeferred("dataReceived")
-    f2 = ReconF(eq)
-    p2_client = await eps1.connect.connect(f2)
-    p2_server = await f0.deferreds["connectionMade"]
+    f2.resetDeferred("dataReceived")
+    f3 = ReconF(eq)
+    p2_client = await eps1.subprotocol_connector_for("proto").connect(f3)
+    p2_server = await f1.deferreds["connectionMade"]
     p2_server.transport.write(b"hello p2\n")
-    data = await f2.deferreds["dataReceived"]
+    data = await f3.deferreds["dataReceived"]
     assert data == b"hello p2\n"
     p2_client.transport.write(b"hello from p2\n")
-    data = await f0.deferreds["dataReceived"]
+    data = await f1.deferreds["dataReceived"]
     assert data == b"hello from p2\n"
-    assert not f1.deferreds["dataReceived"].called
+    assert not f2.deferreds["dataReceived"].called
 
     # now close the first subchannel (p1) from the listener side
     p1_server.transport.loseConnection()
-    await f0.deferreds["connectionLost"]
     await f1.deferreds["connectionLost"]
+    await f2.deferreds["connectionLost"]
 
-    f0.resetDeferred("connectionLost")
+    f1.resetDeferred("connectionLost")
     # and close the second from the connector side
     p2_client.transport.loseConnection()
-    await f0.deferreds["connectionLost"]
-    await f2.deferreds["connectionLost"]
+    await f1.deferreds["connectionLost"]
+    await f3.deferreds["connectionLost"]
 
     await w1.close()
     await w2.close()

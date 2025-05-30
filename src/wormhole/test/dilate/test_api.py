@@ -6,7 +6,7 @@ from zope.interface import implementer
 from twisted.internet.task import deferLater
 from twisted.internet.protocol import Factory
 
-from ... import create, ISubchannelFactory
+from ...import create
 from ...errors import LonelyError
 from ...eventual import EventualQueue
 from ..._dilation._noise import NoiseConnection
@@ -104,7 +104,7 @@ async def test_on_status_error(reactor, mailbox):
             reactor,
             versions={"fun": "quux"},
             _eventual_queue=eq,
-            dilation_subprotocols={SubFac()},
+            dilation=True,
             on_status_update=on_status,
         )
         await w.allocate_code()
@@ -116,7 +116,6 @@ async def test_on_status_error(reactor, mailbox):
             pass
 
 
-@implementer(ISubchannelFactory)
 class SubFac(Factory):
     subprotocol = "jemison"
 
@@ -137,7 +136,7 @@ async def test_dilation_status(reactor, mailbox):
         reactor,
         versions={"fun": "quux"},
         _eventual_queue=eq,
-        dilation_subprotocols={SubFac()},
+        dilation=True,
         on_status_update=wormhole_status0.append,
     )
 
@@ -146,7 +145,7 @@ async def test_dilation_status(reactor, mailbox):
         reactor,
         versions={"bar": "baz"},
         _eventual_queue=eq,
-        dilation_subprotocols={SubFac()},
+        dilation=True,
         on_status_update=wormhole_status1.append,
     )
 
@@ -155,8 +154,8 @@ async def test_dilation_status(reactor, mailbox):
 
     w1.set_code(code)
 
-    w0.dilate(on_status_update=status0.append)
-    w1.dilate(on_status_update=status1.append)
+    w0.dilate({}, on_status_update=status0.append)
+    w1.dilate({}, on_status_update=status1.append)
 
     # we should see the _other side's_ app-versions
     v0 = await w1.get_versions()
